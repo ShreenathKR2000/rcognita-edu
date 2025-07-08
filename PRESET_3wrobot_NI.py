@@ -176,8 +176,8 @@ def run_lqr(dt, Tfinal, x0, x_goal):
         # Control inputs plot
     plt.figure()
     for i, U in enumerate(all_U, start=1):
-        plt.plot(t_vec[:-1], U[:,0], label=f"Linear acc Sim {i}")
-        plt.plot(t_vec[:-1], U[:,1], '--', label=f"Angular acc Sim {i}")
+        plt.plot(t_vec[:-1], U[:,0], label=f"Velocity Sim {i}")
+        plt.plot(t_vec[:-1], U[:,1], '--', label=f"Omega Sim {i}")
     plt.title("LQR: Control Inputs")
     plt.xlabel("time [s]")
     plt.ylabel("control input")
