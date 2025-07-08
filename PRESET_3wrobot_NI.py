@@ -109,6 +109,7 @@ def run_lqr(dt, Tfinal, x0, x_goal):
     all_X   = []
     all_err = []
     all_cost= []
+    all_U = []
 
     # linearized matrices at θ=0
     A = np.array([[1,0,-dt],[0,1,dt],[0,0,1]])
@@ -120,6 +121,7 @@ def run_lqr(dt, Tfinal, x0, x_goal):
         X   = np.zeros((len(t_vec),3))
         err = np.zeros(len(t_vec))
         cost_accum = np.zeros(len(t_vec))
+        U = np.zeros((len(t_vec)-1, 2))
 
         x = x0.copy()
         J = 0.0
@@ -137,10 +139,12 @@ def run_lqr(dt, Tfinal, x0, x_goal):
                 err[k]  = np.linalg.norm(e[:2])
                 J      += e.T@Q@e + u.T@R@u
                 cost_accum[k] = J
+                U[k] = u
 
         all_X.append(X)
         all_err.append(err)
         all_cost.append(cost_accum)
+        all_U.append(U)
 
     os.makedirs("lqr_results", exist_ok=True)
 
@@ -168,6 +172,19 @@ def run_lqr(dt, Tfinal, x0, x_goal):
     plt.title("LQR: Accumulated Cost")
     plt.xlabel("time [s]"); plt.ylabel("cost"); plt.grid(); plt.legend()
     plt.savefig("lqr_results/all_costs.png"); plt.close()
+    
+        # Control inputs plot
+    plt.figure()
+    for i, U in enumerate(all_U, start=1):
+        plt.plot(t_vec[:-1], U[:,0], label=f"Linear acc Sim {i}")
+        plt.plot(t_vec[:-1], U[:,1], '--', label=f"Angular acc Sim {i}")
+    plt.title("LQR: Control Inputs")
+    plt.xlabel("time [s]")
+    plt.ylabel("control input")
+    plt.grid()
+    plt.legend(loc='upper right', ncol=2, fontsize='small')
+    plt.savefig("lqr_results/all_controls.png")
+    plt.close()
 
 
 def run_mpc(dt, Tfinal, x0, x_goal):
@@ -189,6 +206,7 @@ def run_mpc(dt, Tfinal, x0, x_goal):
     all_err = []
     all_cost= []
     all_t = []  # to store truncated time vectors per sim
+    all_U = []
     u = np.zeros(2) 
     
     for i, params in enumerate(mpc_sets, start=1):
@@ -213,7 +231,7 @@ def run_mpc(dt, Tfinal, x0, x_goal):
         x5 = np.array([x0[0], x0[1], x0[2], 0.0, 0.0])
         J = 0.0
         k_stop = len(t_vec) - 1  # default to full length if goal not reached
-        
+        U = np.zeros((len(t_vec)-1, 2))
         for k, t in enumerate(t_vec):
             X[k] = x5[:3]
             dist = np.linalg.norm(x5[:2] - x_goal[:2])
@@ -230,6 +248,7 @@ def run_mpc(dt, Tfinal, x0, x_goal):
             u = ctrl.compute_action(t, x5, x_goal_5)
             x5 = robot.integrate(x5, u, t, dt)
             J += ctrl.run_obj(x5, u, x_goal_5)
+            U[k] = u
 
         # Truncate arrays and time vector up to stopping point
         X = X[:k_stop+1]
@@ -241,7 +260,8 @@ def run_mpc(dt, Tfinal, x0, x_goal):
         all_err.append(err)
         all_cost.append(cost_accum)
         all_t.append(t_plot)   # save corresponding time vector
-
+        all_U.append(U[:k_stop])  # store only up to k_stop
+    
     os.makedirs("mpc_results", exist_ok=True)
 
     # Trajectories
@@ -271,6 +291,19 @@ def run_mpc(dt, Tfinal, x0, x_goal):
     plt.savefig("mpc_results/all_costs.png")
     plt.close()
 
+    plt.figure()
+    for i, (U, t_plot) in enumerate(zip(all_U, all_t), start=1):
+        plt.plot(t_plot[:-1], U[:,0], label=f"Linear acc Sim {i}")
+        plt.plot(t_plot[:-1], U[:,1], '--', label=f"Angular acc Sim {i}")
+    plt.title("MPC: Control Inputs")
+    plt.xlabel("time [s]")
+    plt.ylabel("control input")
+    plt.grid()
+    plt.legend(loc='upper right', ncol=2, fontsize='small')
+    plt.savefig("mpc_results/all_controls.png")
+    plt.close()
+    
+# Main entry point for benchmarking
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Benchmark 3‑wheel robot controllers"
