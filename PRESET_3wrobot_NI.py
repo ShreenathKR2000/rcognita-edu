@@ -1,415 +1,298 @@
-"""
-Preset: a 3-wheel robot (kinematic model a. k. a. non-holonomic integrator).
-
-"""
-  
-import pathlib  
-  
-import warnings
-import csv
-from datetime import datetime
-import matplotlib.animation as animation
-import matplotlib.pyplot as plt
-import numpy as np
-
-import systems
-import simulator
-import controllers
-import loggers
-import visuals
-from utilities import on_key_press
-
+#!/usr/bin/env python3
+import os
 import argparse
+import numpy as np
+import matplotlib.pyplot as plt
 
-#----------------------------------------Set up dimensions
-dim_state = 3
-dim_input = 2
-dim_output = dim_state
-dim_disturb = 0
+# adjust these imports to your package structure:
+from systems     import Sys3WRobotNI, Sys3WRobot
+from controllers import N_CTRL, ControllerLQR, ControllerMPC
 
-dim_R1 = dim_output + dim_input
-dim_R2 = dim_R1
+def run_kinematic(dt, Tfinal, x0, x_goal):
+    gain_sets = [
+        {"k_rho": 0.5, "k_alpha": 1.5, "k_beta": -0.5},
+        {"k_rho": 0.7, "k_alpha": 2.0, "k_beta": -0.8},
+        {"k_rho": 0.9, "k_alpha": 2.5, "k_beta": -1.0},
+        {"k_rho": 1.1, "k_alpha": 3.0, "k_beta": -1.2},
+        {"k_rho": 1.3, "k_alpha": 3.5, "k_beta": -1.5},
+        {"k_rho": 1.5, "k_alpha": 4.0, "k_beta": -1.7},
+        {"k_rho": 1.7, "k_alpha": 4.5, "k_beta": -2.0},
+        {"k_rho": 1.9, "k_alpha": 5.0, "k_beta": -2.2},
+        {"k_rho": 2.1, "k_alpha": 5.5, "k_beta": -2.5},
+        {"k_rho": 2.3, "k_alpha": 6.0, "k_beta": -2.8},
+    ]
 
-description = "Agent-environment preset: a 3-wheel robot (kinematic model a.k.a. non-holonomic integrator)."
+    t_vec = np.arange(0, Tfinal+dt, dt)
+    all_X = []
+    all_err = []
+    all_U = []
 
-parser = argparse.ArgumentParser(description=description)
+    for i, gains in enumerate(gain_sets, start=1):
+        robot = Sys3WRobotNI(sys_type='discr_fnc',
+                             dim_state=3, dim_input=2,
+                             dim_output=3, dim_disturb=0,
+                             ctrl_bnds=np.array([[0,1],[-1,1]]))
+        ctrl  = N_CTRL(k_rho=gains["k_rho"],
+                       k_alpha=gains["k_alpha"],
+                       k_beta=gains["k_beta"],
+                       ctrl_bnds=robot.ctrl_bnds,
+                       t0=0.0, sampling_time=dt)
 
-parser.add_argument('--ctrl_mode', metavar='ctrl_mode', type=str,
-                    choices=['MPC',
-                             "N_CTRL"],
-                    default='N_CTRL',
-                    help='Control mode. Currently available: ' +
-                    '----manual: manual constant control specified by action_manual; ' +
-                    '----nominal: nominal controller, usually used to benchmark optimal controllers;' +                     
-                    '----MPC:model-predictive control; ' +
-                    '----RQL: Q-learning actor-critic with Nactor-1 roll-outs of running objective; ' +
-                    '----SQL: stacked Q-learning; ' + 
-                    '----RLStabLyap: (experimental!) learning agent with Lyapunov-like stabilizing contraints.')
-parser.add_argument('--dt', type=float, metavar='dt',
-                    default=0.1,
-                    help='Controller sampling time.' )
-parser.add_argument('--t1', type=float, metavar='t1',
-                    default=30,
-                    help='Final time of episode.' )
-parser.add_argument('--Nruns', type=int,
-                    default=1,
-                    help='Number of episodes. Learned parameters are not reset after an episode.')
-parser.add_argument('--is_log_data', type=int,
-                    default=1,
-                    help='Flag to log data into a data file. Data are stored in simdata folder.')
-parser.add_argument('--is_visualization', type=int,
-                    default=1,
-                    help='Flag to produce graphical output.')
-parser.add_argument('--is_print_sim_step', type=int,
-                    default=1,
-                    help='Flag to print simulation data into terminal.')
-parser.add_argument('--action_manual', type=float,
-                    default=[-5, -3], nargs='+',
-                    help='Manual control action to be fed constant, system-specific!')
-parser.add_argument('--Nactor', type=int,
-                    default=6,
-                    help='Horizon length (in steps) for predictive controllers.')
-parser.add_argument('--pred_step_size_multiplier', type=float,
-                    default=5.0,
-                    help='Size of each prediction step in seconds is a pred_step_size_multiplier multiple of controller sampling time dt.')
-parser.add_argument('--buffer_size', type=int,
-                    default=25,
-                    help='Size of the buffer (experience replay) for model estimation, agent learning etc.')
-parser.add_argument('--run_obj_struct', type=str,
-                    default='quadratic',
-                    choices=['quadratic',
-                             'biquadratic'],
-                    help='Structure of running objective function.')
-parser.add_argument('--R1_diag', type=float, nargs='+',
-                    default=[100, 100, 10, 0, 0],
-                    help='Parameter of running objective function. Must have proper dimension. ' +
-                    'Say, if chi = [observation, action], then a quadratic running objective reads chi.T diag(R1) chi, where diag() is transformation of a vector to a diagonal matrix.')
-parser.add_argument('--R2_diag', type=float, nargs='+',
-                    default=[1, 10, 1, 0, 0],
-                    help='Parameter of running objective function . Must have proper dimension. ' + 
-                    'Say, if chi = [observation, action], then a bi-quadratic running objective reads chi**2.T diag(R2) chi**2 + chi.T diag(R1) chi, ' +
-                    'where diag() is transformation of a vector to a diagonal matrix.')
-parser.add_argument('--Ncritic', type=int,
-                    default=25,
-                    help='Critic stack size (number of temporal difference terms in critic cost).')
-parser.add_argument('--gamma', type=float,
-                    default=0.9,
-                    help='Discount factor.')
-parser.add_argument('--critic_period_multiplier', type=float,
-                    default=1.0,
-                    help='Critic is updated every critic_period_multiplier times dt seconds.')
-parser.add_argument('--critic_struct', type=str,
-                    default='quad-mix', choices=['quad-lin',
-                                                   'quadratic',
-                                                   'quad-nomix',
-                                                   'quad-mix',
-                                                   'poly3',
-                                                   'poly4'],
-                    help='Feature structure (critic). Currently available: ' +
-                    '----quad-lin: quadratic-linear; ' +
-                    '----quadratic: quadratic; ' +
-                    '----quad-nomix: quadratic, no mixed terms; ' +
-                    '----quad-mix: quadratic, mixed observation-action terms (for, say, Q or advantage function approximations); ' +
-                    '----poly3: 3-order model, see the code for the exact structure; ' +
-                    '----poly4: 4-order model, see the code for the exact structure. '
-                    )
-parser.add_argument('--actor_struct', type=str,
-                    default='quad-nomix', choices=['quad-lin',
-                                                   'quadratic',
-                                                   'quad-nomix'],
-                    help='Feature structure (actor). Currently available: ' +
-                    '----quad-lin: quadratic-linear; ' +
-                    '----quadratic: quadratic; ' +
-                    '----quad-nomix: quadratic, no mixed terms.')
-parser.add_argument('--init_robot_pose_x', type=float,
-                    default=-3.0,
-                    help='Initial x-coordinate of the robot pose.')
-parser.add_argument('--init_robot_pose_y', type=float,
-                    default=-3.0,
-                    help='Initial y-coordinate of the robot pose.')
-parser.add_argument('--init_robot_pose_theta', type=float,
-                    default=1.57,
-                    help='Initial orientation angle (in radians) of the robot pose.')
-parser.add_argument('--distortion_x', type=float,
-                    default=-0.6,
-                    help='X-coordinate of the center of distortion.')
-parser.add_argument('--distortion_y', type=float,
-                    default=-0.5,
-                    help='Y-coordinate of the center of distortion.')
-parser.add_argument('--distortion_sigma', type=float,
-                    default=0.1,
-                    help='Standard deviation (sigma) of distortion.')
-parser.add_argument('--seed', type=int,
-                    default=1,
-                    help='Seed for random number generation.')
+        X   = np.zeros((len(t_vec),3))
+        U   = np.zeros((len(t_vec)-1,2))
+        err = np.zeros(len(t_vec))
 
-args = parser.parse_args()
+        x = x0.copy()
+        for k, t in enumerate(t_vec):
+            X[k] = x
+            obs = np.concatenate([x, x_goal])
+            u   = ctrl.compute_action(t, obs)
+            if k < len(t_vec)-1:
+                U[k]   = u
+                x      = robot.integrate(x, u, t, dt)
+                err[k] = np.linalg.norm(x[:2] - x_goal[:2])
 
-seed=args.seed
-print(seed)
+        all_X.append(X)
+        all_err.append(err)
+        all_U.append(U)
 
-xdistortion_x = args.distortion_x
-ydistortion_y = args.distortion_y
-distortion_sigma = args.distortion_sigma
+    # Combined plots
+    os.makedirs("kinematic_results", exist_ok=True)
 
-x = args.init_robot_pose_x
-y = args.init_robot_pose_y
-theta = args.init_robot_pose_theta
+    # Trajectories
+    plt.figure()
+    for i, X in enumerate(all_X, start=1):
+        plt.plot(X[:,0], X[:,1], label=f"Sim {i}")
+    plt.plot(x_goal[0], x_goal[1], 'rx', label="Goal")
+    plt.title("Kinematic Controller: Trajectories")
+    plt.xlabel("x [m]"); plt.ylabel("y [m]"); plt.grid(); plt.legend()
+    plt.savefig("kinematic_results/all_trajectories.png")
+    plt.close()
 
-while theta > np.pi:
-        theta -= 2 * np.pi
-while theta < -np.pi:
-        theta += 2 * np.pi
+    # Errors
+    plt.figure()
+    for i, err in enumerate(all_err, start=1):
+        plt.plot(t_vec, err, label=f"Sim {i}")
+    plt.title("Kinematic Controller: Tracking Error")
+    plt.xlabel("time [s]"); plt.ylabel("||e|| [m]"); plt.grid(); plt.legend()
+    plt.savefig("kinematic_results/all_errors.png")
+    plt.close()
 
-state_init = np.array([x, y, theta])
-
-args.action_manual = np.array(args.action_manual)
-
-pred_step_size = args.dt * args.pred_step_size_multiplier
-critic_period = args.dt * args.critic_period_multiplier
-
-R1 = np.diag(np.array(args.R1_diag))
-R2 = np.diag(np.array(args.R2_diag))
-
-assert args.t1 > args.dt > 0.0
-assert state_init.size == dim_state
-
-globals().update(vars(args))
-
-#----------------------------------------Fixed settings
-is_disturb = 0
-is_dyn_ctrl = 0
-
-t0 = 0
-
-action_init = 0 * np.ones(dim_input)
-
-# Solver
-atol = 1e-3
-rtol = 1e-2
-
-# xy-plane
-xMin = -4#-1.2
-xMax = 0.2
-yMin = -4#-1.2
-yMax = 0.2
-
-# Control constraints
-v_min = -0.22 *10
-v_max = 0.22 *10
-omega_min = -2.84
-omega_max = 2.84
-
-ctrl_bnds=np.array([[v_min, v_max], [omega_min, omega_max]])
-
-#----------------------------------------Initialization : : system
-my_sys = systems.Sys3WRobotNI(sys_type="diff_eqn", 
-                                     dim_state=dim_state,
-                                     dim_input=dim_input,
-                                     dim_output=dim_output,
-                                     dim_disturb=dim_disturb,
-                                     pars=[],
-                                     ctrl_bnds=ctrl_bnds,
-                                     is_dyn_ctrl=is_dyn_ctrl,
-                                     is_disturb=is_disturb,
-                                     pars_disturb=[])
-
-observation_init = my_sys.out(state_init)
-
-xCoord0 = state_init[0]
-yCoord0 = state_init[1]
-alpha0 = state_init[2]
-alpha_deg_0 = alpha0/2/np.pi
-
-#----------------------------------------Initialization : : model
-
-#----------------------------------------Initialization : : controller
-my_ctrl_nominal = None 
-
-# Predictive optimal controller
-my_ctrl_opt_pred = controllers.ControllerOptimalPredictive(dim_input,
-                                           dim_output,
-                                           ctrl_mode,
-                                           ctrl_bnds = ctrl_bnds,
-                                           action_init = [],
-                                           t0 = t0,
-                                           sampling_time = dt,
-                                           Nactor = Nactor,
-                                           pred_step_size = pred_step_size,
-                                           sys_rhs = my_sys._state_dyn,
-                                           sys_out = my_sys.out,
-                                           state_sys = state_init,
-                                           buffer_size = buffer_size,
-                                           gamma = gamma,
-                                           Ncritic = Ncritic,
-                                           critic_period = critic_period,
-                                           critic_struct = critic_struct,
-                                           run_obj_struct = run_obj_struct,
-                                           run_obj_pars = [R1],
-                                           observation_target = [],
-                                           state_init=state_init,
-                                           obstacle=[xdistortion_x, ydistortion_y,distortion_sigma],
-                                           seed=seed)
+    # Control inputs
+    plt.figure()
+    for i, U in enumerate(all_U, start=1):
+        plt.plot(t_vec[:-1], U[:,0],   label=f"v Sim {i}")
+        plt.plot(t_vec[:-1], U[:,1],   '--', label=f"ω Sim {i}")
+    plt.title("Kinematic Controller: Control Inputs")
+    plt.xlabel("time [s]"); plt.ylabel("input"); plt.grid()
+    # to avoid huge legend, only label first few
+    plt.legend(ncol=2, fontsize='small')
+    plt.savefig("kinematic_results/all_controls.png")
+    plt.close()
 
 
-my_ctrl_benchm = my_ctrl_opt_pred
+def run_lqr(dt, Tfinal, x0, x_goal):
+    lqr_sets = [
+        (np.diag([1, 1, 0.1]), np.diag([0.5, 0.5])),
+        (np.diag([2, 2, 0.2]), np.diag([0.4, 0.4])),
+        (np.diag([3, 3, 0.3]), np.diag([0.3, 0.3])),
+        (np.diag([4, 4, 0.4]), np.diag([0.25, 0.25])),
+        (np.diag([5, 5, 0.5]), np.diag([0.2, 0.2])),
+        (np.diag([6, 6, 0.6]), np.diag([0.15, 0.15])),
+        (np.diag([7, 7, 0.7]), np.diag([0.1, 0.1])),
+        (np.diag([8, 8, 0.8]), np.diag([0.08, 0.08])),
+        (np.diag([9, 9, 0.9]), np.diag([0.05, 0.05])),
+        (np.diag([10, 10, 1.0]), np.diag([0.01, 0.01])),
+    ]
+
+    t_vec = np.arange(0, Tfinal+dt, dt)
+    all_X   = []
+    all_err = []
+    all_cost= []
+
+    # linearized matrices at θ=0
+    A = np.array([[1,0,-dt],[0,1,dt],[0,0,1]])
+    B = np.array([[dt,0],[0,0],[0,dt]])
+
+    for i, (Q, R) in enumerate(lqr_sets, start=1):
+        ctrl = ControllerLQR(A, B, Q, R, sampling_time=dt)
+
+        X   = np.zeros((len(t_vec),3))
+        err = np.zeros(len(t_vec))
+        cost_accum = np.zeros(len(t_vec))
+
+        x = x0.copy()
+        J = 0.0
+        for k, t in enumerate(t_vec):
+            X[k] = x
+            u    = ctrl.compute_action(t, x, x_goal)
+            u[0] = np.clip(u[0], 0, 1)
+            u[1] = np.clip(u[1], -1, 1)
+            if k < len(t_vec)-1:
+                # unicycle kinematics
+                x[0] += dt*u[0]*np.cos(x[2])
+                x[1] += dt*u[0]*np.sin(x[2])
+                x[2] += dt*u[1]
+                e       = x - x_goal
+                err[k]  = np.linalg.norm(e[:2])
+                J      += e.T@Q@e + u.T@R@u
+                cost_accum[k] = J
+
+        all_X.append(X)
+        all_err.append(err)
+        all_cost.append(cost_accum)
+
+    os.makedirs("lqr_results", exist_ok=True)
+
+    # Trajectories
+    plt.figure()
+    for i, X in enumerate(all_X, start=1):
+        plt.plot(X[:,0], X[:,1], label=f"Sim {i}")
+    plt.plot(x_goal[0], x_goal[1], 'rx', label="Goal")
+    plt.title("LQR: Trajectories")
+    plt.xlabel("x [m]"); plt.ylabel("y [m]"); plt.grid(); plt.legend()
+    plt.savefig("lqr_results/all_trajectories.png"); plt.close()
+
+    # Errors
+    plt.figure()
+    for i, err in enumerate(all_err, start=1):
+        plt.plot(t_vec, err, label=f"Sim {i}")
+    plt.title("LQR: Tracking Error")
+    plt.xlabel("time [s]"); plt.ylabel("||e|| [m]"); plt.grid(); plt.legend()
+    plt.savefig("lqr_results/all_errors.png"); plt.close()
+
+    # Accumulated Cost
+    plt.figure()
+    for i, cost in enumerate(all_cost, start=1):
+        plt.plot(t_vec, cost, label=f"Sim {i}")
+    plt.title("LQR: Accumulated Cost")
+    plt.xlabel("time [s]"); plt.ylabel("cost"); plt.grid(); plt.legend()
+    plt.savefig("lqr_results/all_costs.png"); plt.close()
+
+
+def run_mpc(dt, Tfinal, x0, x_goal):
+    mpc_sets = [
+        {"N": 20, "Q": np.diag([10, 10, 2, 20, 20]),  "R": np.diag([0.4, 0.4]),  "Qf": np.diag([50, 50, 10, 100, 100])},
+        {"N": 25, "Q": np.diag([12, 12, 2, 25, 25]),  "R": np.diag([0.35, 0.35]),"Qf": np.diag([60, 60, 12, 120, 120])},
+        {"N": 32, "Q": np.diag([15, 15, 3, 33, 33]),  "R": np.diag([0.3, 0.3]),  "Qf": np.diag([75, 75, 15, 150, 150])},
+        {"N": 35, "Q": np.diag([16, 16, 3, 35, 35]),  "R": np.diag([0.25, 0.25]),"Qf": np.diag([80, 80, 15, 160, 160])},
+        {"N": 40, "Q": np.diag([18, 18, 4, 40, 40]),  "R": np.diag([0.2, 0.2]),  "Qf": np.diag([90, 90, 20, 180, 180])},
+        {"N": 45, "Q": np.diag([20, 20, 4, 45, 45]),  "R": np.diag([0.18, 0.18]),"Qf": np.diag([100, 100, 20, 200, 200])},
+        {"N": 50, "Q": np.diag([22, 22, 5, 50, 50]),  "R": np.diag([0.15, 0.15]),"Qf": np.diag([110, 110, 25, 220, 220])},
+        {"N": 55, "Q": np.diag([24, 24, 5, 55, 55]),  "R": np.diag([0.12, 0.12]),"Qf": np.diag([120, 120, 25, 240, 240])},
+        {"N": 60, "Q": np.diag([26, 26, 6, 60, 60]),  "R": np.diag([0.1, 0.1]),  "Qf": np.diag([130, 130, 30, 260, 260])},
+        {"N": 60, "Q": np.diag([28, 28, 6, 60, 60]),  "R": np.diag([0.08, 0.08]),"Qf": np.diag([140, 140, 30, 280, 280])},
+    ]
+
+    t_vec = np.arange(0, Tfinal+dt, dt)
+    all_X   = []
+    all_err = []
+    all_cost= []
+    all_t = []  # to store truncated time vectors per sim
+    u = np.zeros(2) 
     
-#----------------------------------------Initialization : : simulator
-my_simulator = simulator.Simulator(sys_type = "diff_eqn",
-                                   closed_loop_rhs = my_sys.closed_loop_rhs,
-                                   sys_out = my_sys.out,
-                                   state_init = state_init,
-                                   disturb_init = [],
-                                   action_init = action_init,
-                                   t0 = t0,
-                                   t1 = t1,
-                                   dt = dt,
-                                   max_step = dt,
-                                   first_step = 1e-4,
-                                   atol = atol,
-                                   rtol = rtol,
-                                   is_disturb = is_disturb,
-                                   is_dyn_ctrl = is_dyn_ctrl)
+    for i, params in enumerate(mpc_sets, start=1):
+        # Use full 5-state robot model, discrete-time
+        robot = Sys3WRobot(sys_type='discr_fnc',
+                           dim_state=5, dim_input=2,
+                           dim_output=5, dim_disturb=0,
+                           pars=[1.0, 0.1],
+                           ctrl_bnds=np.array([[0,1],[-1,1]]))
+        ctrl  = ControllerMPC(N=params["N"],
+                              Q=params["Q"], R=params["R"],
+                              Qf=params["Qf"],
+                              sampling_time=dt,
+                              sys_model=robot)
 
-#----------------------------------------Initialization : : logger
-date = datetime.now().strftime("%Y-%m-%d")
-time = datetime.now().strftime("%Hh%Mm%Ss")
-datafiles = [None] * Nruns
+        X   = np.zeros((len(t_vec),3))  # only store first 3 states (x,y,theta) for plotting
+        x_goal_5 = np.array([x_goal[0], x_goal[1], x_goal[2], 0.0, 0.0])  # Target 5D state
+        err = np.zeros(len(t_vec))
+        cost_accum = np.zeros(len(t_vec))
 
-data_folder = 'simdata/' + ctrl_mode + "/Init_angle_{}_seed_{}_Nactor_{}".format(str(state_init[2]), seed, Nactor)
-
-if is_log_data:
-    pathlib.Path(data_folder).mkdir(parents=True, exist_ok=True) 
-
-for k in range(0, Nruns):
-    datafiles[k] = data_folder + '/' + my_sys.name + '_' + ctrl_mode + '_' + date + '_' + time + '__run{run:02d}.csv'.format(run=k+1)
-    
-    if is_log_data:
-        print('Logging data to:    ' + datafiles[k])
-            
-        with open(datafiles[k], 'w', newline='') as outfile:
-            writer = csv.writer(outfile)
-            writer.writerow(['System', my_sys.name ] )
-            writer.writerow(['Controller', ctrl_mode ] )
-            writer.writerow(['dt', str(dt) ] )
-            writer.writerow(['state_init', str(state_init) ] )
-            writer.writerow(['Nactor', str(Nactor) ] )
-            writer.writerow(['pred_step_size_multiplier', str(pred_step_size_multiplier) ] )
-            writer.writerow(['buffer_size', str(buffer_size) ] )
-            writer.writerow(['run_obj_struct', str(run_obj_struct) ] )
-            writer.writerow(['R1_diag', str(R1_diag) ] )
-            writer.writerow(['R2_diag', str(R2_diag) ] )
-            writer.writerow(['Ncritic', str(Ncritic) ] )
-            writer.writerow(['gamma', str(gamma) ] )
-            writer.writerow(['critic_period_multiplier', str(critic_period_multiplier) ] )
-            writer.writerow(['critic_struct', str(critic_struct) ] )
-            writer.writerow(['actor_struct', str(actor_struct) ] )   
-            writer.writerow(['t [s]', 'x [m]', 'y [m]', 'alpha [rad]', 'run_obj', 'accum_obj', 'v [m/s]', 'omega [rad/s]'] )
-
-# Do not display annoying warnings when print is on
-if is_print_sim_step:
-    warnings.filterwarnings('ignore')
-    
-my_logger = loggers.Logger3WRobotNI()
-
-#----------------------------------------Main loop
-state_full_init = my_simulator.state_full
-
-if is_visualization:
-    my_animator = visuals.Animator3WRobotNI(objects=(my_simulator,
-                                                     my_sys,
-                                                     my_ctrl_nominal,
-                                                     my_ctrl_benchm,
-                                                     datafiles,
-                                                     controllers.ctrl_selector,
-                                                     my_logger),
-                                            pars=(state_init,
-                                                  action_init,
-                                                  t0,
-                                                  t1,
-                                                  state_full_init,
-                                                  xMin,
-                                                  xMax,
-                                                  yMin,
-                                                  yMax,
-                                                  ctrl_mode,
-                                                  action_manual,
-                                                  v_min,
-                                                  omega_min,
-                                                  v_max,
-                                                  omega_max,
-                                                  Nruns,
-                                                  is_print_sim_step, is_log_data, 0, [], [xdistortion_x, ydistortion_y,distortion_sigma]))
-
-    anm = animation.FuncAnimation(my_animator.fig_sim,
-                                  my_animator.animate,
-                                  init_func=my_animator.init_anim,
-                                  blit=False, interval=dt/1e6, repeat=False)
-    print("ALSO GOOD")
-    my_animator.get_anm(anm)
-    
-    cId = my_animator.fig_sim.canvas.mpl_connect('key_press_event', lambda event: on_key_press(event, anm))
-    
-    anm.running = True
-    
-    my_animator.fig_sim.tight_layout()
-    
-    plt.show()
-    
-else:   
-    run_curr = 1
-    datafile = datafiles[0]
-    
-    while True:
+        # Initialize 5D state vector: [x, y, theta, v, omega]
+        x5 = np.array([x0[0], x0[1], x0[2], 0.0, 0.0])
+        J = 0.0
+        k_stop = len(t_vec) - 1  # default to full length if goal not reached
         
-        my_simulator.sim_step()
-        
-        t, state, observation, state_full = my_simulator.get_sim_step_data()
-        
-        action = controllers.ctrl_selector(t, observation, action_manual, my_ctrl_nominal, my_ctrl_benchm, ctrl_mode)
-        
-        my_sys.receive_action(action)
-        my_ctrl_benchm.receive_sys_state(my_sys._state)
-        my_ctrl_benchm.upd_accum_obj(observation, action)
-        
-        xCoord = state_full[0]
-        yCoord = state_full[1]
-        alpha = state_full[2]
-        
-        run_obj = my_ctrl_benchm.run_obj(observation, action)
-        accum_obj = my_ctrl_benchm.accum_obj_val
-        
-        count_CALF = my_ctrl_benchm.D_count()
-        count_N_CTRL = my_ctrl_benchm.get_N_CTRL_count()
+        for k, t in enumerate(t_vec):
+            X[k] = x5[:3]
+            dist = np.linalg.norm(x5[:2] - x_goal[:2])
 
-        if is_print_sim_step:
-            my_logger.print_sim_step(t, xCoord, yCoord, alpha, run_obj, accum_obj, action)
-            
-        if is_log_data:
-            my_logger.log_data_row(datafile, t, xCoord, yCoord, alpha, run_obj, accum_obj, action)
-        
-
-        if t >= t1 or np.linalg.norm(observation[:2]) < 0.2:
-
-            # Reset simulator
-            my_simulator.reset()
-            
-            if ctrl_mode != 'nominal':
-                my_ctrl_benchm.reset(t0)
-            else:
-                my_ctrl_nominal.reset(t0)
-            
-            accum_obj = 0 
-
-            if is_print_sim_step:
-                print('.....................................Run {run:2d} done.....................................'.format(run = run_curr))
-                
-            run_curr += 1
-            
-            if run_curr > Nruns:
-                plt.close('all')
+            err[k] = dist                 # assign error here
+            cost_accum[k] = J
+            # STOP if within tolerance
+            if dist < 0.3:
+                print(f"✅ Robot reached goal in Sim {i} at t={t:.2f}s")
+                k_stop = k
                 break
-                
-            if is_log_data:
-                datafile = datafiles[run_curr-1]
-                 
+
+            # normal MPC update
+            u = ctrl.compute_action(t, x5, x_goal_5)
+            x5 = robot.integrate(x5, u, t, dt)
+            J += ctrl.run_obj(x5, u, x_goal_5)
+
+        # Truncate arrays and time vector up to stopping point
+        X = X[:k_stop+1]
+        err = err[:k_stop+1]
+        cost_accum = cost_accum[:k_stop+1]
+        t_plot = t_vec[:k_stop+1]
+
+        all_X.append(X)
+        all_err.append(err)
+        all_cost.append(cost_accum)
+        all_t.append(t_plot)   # save corresponding time vector
+
+    os.makedirs("mpc_results", exist_ok=True)
+
+    # Trajectories
+    plt.figure()
+    for i, X in enumerate(all_X, start=1):
+        plt.plot(X[:,0], X[:,1], label=f"Sim {i}")
+    plt.plot(x_goal[0], x_goal[1], 'rx', label="Goal")
+    plt.title("MPC (5-state): Trajectories")
+    plt.xlabel("x [m]"); plt.ylabel("y [m]"); plt.grid(); plt.legend()
+    plt.savefig("mpc_results/all_trajectories.png"); plt.close()
+
+        # Errors
+    plt.figure()
+    for i, (err, t_plot) in enumerate(zip(all_err, all_t), start=1):
+        plt.plot(t_plot, err, label=f"Sim {i}")  # Use correct time vector per err
+    plt.title("MPC (5-state): Tracking Error")
+    plt.xlabel("time [s]"); plt.ylabel("||e|| [m]"); plt.grid(); plt.legend()
+    plt.savefig("mpc_results/all_errors.png")
+    plt.close()
+
+    # Accumulated Cost
+    plt.figure()
+    for i, (cost, t_plot) in enumerate(zip(all_cost, all_t), start=1):
+        plt.plot(t_plot, cost, label=f"Sim {i}")
+    plt.title("MPC (5-state): Accumulated Cost")
+    plt.xlabel("time [s]"); plt.ylabel("cost"); plt.grid(); plt.legend()
+    plt.savefig("mpc_results/all_costs.png")
+    plt.close()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Benchmark 3‑wheel robot controllers"
+    )
+    parser.add_argument(
+        "--ctrl_mode", choices=["N_CTRL","LQR","MPC"],
+        default="N_CTRL",
+        help="which controller to benchmark"
+    )
+    args = parser.parse_args()
+
+    # common initial/goal
+    dt     = 0.1
+    Tfinal = 20.0
+    x0     = np.array([0.0,0.0,0.0])
+    x_goal = np.array([2.0,2.0,0.0])
+
+    if args.ctrl_mode == "N_CTRL":
+        run_kinematic(dt, Tfinal, x0, x_goal)
+    elif args.ctrl_mode == "LQR":
+        run_lqr(dt, Tfinal, x0, x_goal)
+    elif args.ctrl_mode == "MPC":
+        run_mpc(dt, Tfinal, x0, x_goal)
+
+    print(f"All {args.ctrl_mode} simulations done. Check the corresponding folder.")
